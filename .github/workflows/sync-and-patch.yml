@@ -1,0 +1,253 @@
+name: Sync upstream, apply patch, test, and (optional) release
+
+on:
+  schedule:
+    - cron: "17 */48 * * *"   # every 6 hours (offset to avoid global cron burst)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # 🔁 Upstream (original) repository URL — CHANGE THIS to the real original repo:
+  UPSTREAM_URL: "https://github.com/Tasshack/dreame-vacuum.git"
+
+  # 🌿 Branches
+  BASE_BRANCH: "master"        # your fork's base branch that mirrors upstream
+  PATCH_BRANCH: "no-nag"     # your patched branch (also set as your repo's default branch)
+
+  # 🩹 One-line patch (search → replace) — do not change unless you modify your patch approach
+  PATCH_FIND: "if not options.get(CONF_DONATED):"
+  PATCH_REPLACE: "if False and not options.get(CONF_DONATED):"
+  PATCH_GLOB: "custom_components/dreame_vacuum/**/*.py"
+
+  # 📦 Release mode for HACS “Use releases”
+  # Set to "true" to publish releases with dreame_vacuum.zip (if HACS expects releases).
+  # Leave "false" if HACS should pull the default branch.
+  RELEASE_MODE: "true"
+
+jobs:
+  sync-patch-test:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+
+    steps:
+      - name: Checkout patched branch (default)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream "${UPSTREAM_URL}" || true
+          git fetch upstream --prune
+
+      # --- Sync BASE_BRANCH (main) with upstream/main (hard sync) ---
+      - name: Ensure local base branch exists
+        run: |
+          if ! git show-ref --verify --quiet refs/heads/${{ env.BASE_BRANCH }}; then
+            if git ls-remote --exit-code --heads origin ${{ env.BASE_BRANCH }}; then
+              git checkout -b "${{ env.BASE_BRANCH }}" "origin/${{ env.BASE_BRANCH }}"
+            else
+              git checkout -b "${{ env.BASE_BRANCH }}"
+            fi
+          else
+            git checkout "${{ env.BASE_BRANCH }}"
+          fi
+
+      - name: Reset base branch to upstream while ignoring workflow removal
+        run: |
+          # Hard reset base branch to upstream/main
+          git fetch upstream
+          git reset --hard "upstream/${{ env.BASE_BRANCH }}"
+
+          # Push updated base branch
+          git push origin "${{ env.BASE_BRANCH }}" --force
+
+      # --- Build a fresh PATCH_BRANCH on top of BASE_BRANCH and re-apply patch ---
+      - name: Create build branch from base
+        run: |
+          git checkout -B tmp-build-nonag "${{ env.BASE_BRANCH }}"
+
+      - name: Preserve workflows from PATCH_BRANCH
+        run: |
+          # Bring back the workflow directory from the PATCH_BRANCH so automation is never lost
+          git checkout "${{ env.PATCH_BRANCH }}" -- .github || true
+          git add .github || true
+          git commit -m "Preserve workflows" || true
+
+      - name: Apply one-line patch (disable donation notification)
+        shell: bash
+        run: |
+          set -e
+          echo "Searching for pattern: ${PATCH_FIND}"
+          MATCHED_FILES=$(git grep -l "${PATCH_FIND}" -- ${PATCH_GLOB} || true)
+          if [ -n "$MATCHED_FILES" ]; then
+            echo "Patching files:"
+            echo "$MATCHED_FILES"
+            # GNU sed in Ubuntu runner supports -i without extension
+            echo "$MATCHED_FILES" | xargs -r sed -i "s/${PATCH_FIND}/${PATCH_REPLACE}/g"
+            git add $MATCHED_FILES
+            git commit -m "Apply no-nag patch: replace donation condition"
+          else
+            echo "::warning::No files matched the patch pattern. The patch may already be applied or upstream changed the code."
+          fi
+
+      - name: Show diff summary
+        run: git --no-pager diff --stat "${{ env.BASE_BRANCH }}...HEAD" || true
+
+      # --- Minimal tests: ensure integration imports and Python compiles with HA installed ---
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            homeassistant \
+            pytest \
+            pycryptodome \
+            requests \
+            pillow \
+            defusedxml \
+            numpy \
+            python-miio \
+            py_mini_racer
+
+
+      - name: Compile Python (syntax check)
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          FILES=(custom_components/dreame_vacuum/**/*.py)
+          if [ ${#FILES[@]} -gt 0 ]; then
+            python -m py_compile "${FILES[@]}"
+          else
+            echo "::error::No Python files found under custom_components/dreame_vacuum"
+            exit 1
+          fi
+
+      - name: Create a minimal import test
+        run: |
+          mkdir -p tests
+          cat > tests/test_import.py <<'PY'
+          def test_import():
+              import importlib
+              pkg = importlib.import_module("custom_components.dreame_vacuum")
+              assert pkg is not None
+          PY
+          pytest -q
+
+      # --- If tests passed, update the PATCH_BRANCH atomically ---
+      - name: Update patched branch
+        run: |
+          # Force-update PATCH_BRANCH to the tested build
+          git push origin tmp-build-nonag:${{ env.PATCH_BRANCH }} --force
+
+      - name: Detect upstream default branch
+        id: upstream
+        run: |
+          UB=$(git remote show upstream | awk '/HEAD branch/ {print $NF}')
+          if [ -z "$UB" ]; then UB="master"; fi
+          echo "branch=$UB" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        run: |
+          set -e
+
+          BASE="${{ steps.upstream.outputs.branch }}"
+          
+          echo "Generating changelog compared to upstream/$BASE"
+
+          mkdir -p dist
+
+          # Identify latest upstream sync commit on this branch
+          LAST_SYNC=$(git log origin/${{ env.PATCH_BRANCH }} --grep="Sync with upstream" -n 1 --pretty=format:"%H" || true)
+
+          if [ -z "$LAST_SYNC" ]; then
+            echo "No previous sync found — using entire history."
+            LAST_SYNC="${BASE}"
+          fi
+
+          # Collect upstream changes
+          echo "Collecting upstream commits…"          
+          git log "upstream/$BASE" --pretty=format:"* %s (%h)" --no-merges > dist/upstream_changes.txt
+
+          # Collect patch branch commits (your changes)
+          echo "Collecting patched branch commits…"
+          git log tmp-build-nonag --pretty=format:"* %s (%h)" --no-merges > dist/patch_changes.txt
+
+          # Create changelog section
+          echo "Creating changelog…"
+
+          {
+            echo "## $(date -u +"%Y-%m-%d %H:%M UTC")"
+            echo
+            echo "### Upstream changes:"
+            cat dist/upstream_changes.txt
+            echo
+            echo "### Patch changes:"
+            cat dist/patch_changes.txt
+            echo
+            echo "---"
+            echo
+          } > dist/CHANGELOG_SECTION.md
+
+          # Prepend new section to existing CHANGELOG.md
+          if [ -f CHANGELOG.md ]; then
+            cat CHANGELOG.md >> dist/OLD_CHANGELOG.md
+          fi
+
+          cat dist/CHANGELOG_SECTION.md dist/OLD_CHANGELOG.md > CHANGELOG.md
+
+          git add CHANGELOG.md
+          git commit -m "Update changelog"
+          git push origin "${{ env.PATCH_BRANCH }}" --force
+
+
+      # --- Optional: Create a GitHub Release with dreame_vacuum.zip asset (for HACS "Use releases") ---
+      - name: Package integration zip
+        if: env.RELEASE_MODE == 'true'
+        run: |
+          mkdir -p dist
+          # Zip from the repository root so the archive contains
+          # custom_components/dreame_vacuum/... at the top level
+          zip -r dist/dreame_vacuum.zip custom_components/dreame_vacuum
+
+          cd ..
+
+      - name: Compute short SHA for tag
+        id: sha
+        if: env.RELEASE_MODE == 'true'
+        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Publish GitHub Release (optional)
+        if: env.RELEASE_MODE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.sha.outputs.short }}
+          name: "Automated build ${{ steps.sha.outputs.short }}"
+          draft: false
+          prerelease: false
+          files: dist/dreame_vacuum.zip
+          body: |
+            ## Changelog
+            $(cat dist/CHANGELOG_SECTION.md)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup temp branch (local only)
+        if: always()
+        run: |
+          git checkout "${{ env.PATCH_BRANCH }}" || true
+          git branch -D tmp-build-nonag || true
