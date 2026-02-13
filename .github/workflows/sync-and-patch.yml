@@ -203,12 +203,17 @@ jobs:
             echo
           } > dist/CHANGELOG_SECTION.md
 
-          # Prepend new section to existing CHANGELOG.md
+
+          # If old changelog exists, copy it; otherwise create an empty placeholder
           if [ -f CHANGELOG.md ]; then
-            cat CHANGELOG.md >> dist/OLD_CHANGELOG.md
+            cp CHANGELOG.md dist/OLD_CHANGELOG.md
+          else
+            touch dist/OLD_CHANGELOG.md
           fi
 
+          # Prepend new section above old content
           cat dist/CHANGELOG_SECTION.md dist/OLD_CHANGELOG.md > CHANGELOG.md
+
 
           git add CHANGELOG.md
           git commit -m "Update changelog"
